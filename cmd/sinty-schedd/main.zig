@@ -490,6 +490,50 @@ fn trim(dir: [*:0]const u8, size: u64) void {
     _ = c.g_file_set_contents(TRIM_FILE, text.ptr, @intCast(text.len), null);
 }
 
+const NvmeAdminCommand = extern struct {
+    opcode: u8,
+    flags: u8 = 0,
+    rsvd: u16 = 0,
+    nsid: u32,
+    cdw2: u32 = 0,
+    cdw3: u32 = 0,
+    metadata: u64 = 0,
+    addr: u64,
+    metadata_len: u32 = 0,
+    data_len: u32,
+    cdw10: u32,
+    cdw11: u32 = 0,
+    cdw12: u32 = 0,
+    cdw13: u32 = 0,
+    cdw14: u32 = 0,
+    cdw15: u32 = 0,
+    timeout_ms: u32 = 5000,
+    result: u32 = 0,
+};
+
+const NVME_ADMIN_IOCTL: c_ulong = 0xc0484e41;
+
+fn reportNvme(device: []const u8) void {
+    const controller = care.nvmeController(device) orelse return;
+    var path_buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&path_buf, "/dev/{s}", .{controller}, 0) catch return;
+    const fd = c.open(path.ptr, c.O_RDONLY | c.O_CLOEXEC);
+    if (fd < 0) return;
+    defer _ = c.close(fd);
+    var identify: [4096]u8 align(4096) = undefined;
+    var health: [512]u8 align(4096) = undefined;
+    var ask = NvmeAdminCommand{ .opcode = 0x06, .nsid = 0, .addr = @intFromPtr(&identify), .data_len = identify.len, .cdw10 = 1 };
+    if (c.ioctl(fd, NVME_ADMIN_IOCTL, &ask) != 0) return;
+    ask = NvmeAdminCommand{ .opcode = 0x02, .nsid = 0xffffffff, .addr = @intFromPtr(&health), .data_len = health.len, .cdw10 = (127 << 16) | 2 };
+    if (c.ioctl(fd, NVME_ADMIN_IOCTL, &ask) != 0) return;
+    var out: [512]u8 = undefined;
+    const text = care.nvmeReport(&out, &identify, &health) orelse return;
+    var file_buf: [96]u8 = undefined;
+    const file = std.fmt.bufPrintSentinel(&file_buf, "/run/sinty-scheduler/{s}", .{controller}, 0) catch return;
+    _ = c.g_mkdir_with_parents("/run/sinty-scheduler", 0o755);
+    _ = c.g_file_set_contents_full(file.ptr, text.ptr, @intCast(text.len), c.G_FILE_SET_CONTENTS_CONSISTENT, 0o644, null);
+}
+
 fn careLoop(_: c.gpointer) callconv(.c) c.gpointer {
     c.g_usleep(CARE_START_SECONDS * 1000000);
     var mounts: [16384]u8 = undefined;
@@ -497,6 +541,7 @@ fn careLoop(_: c.gpointer) callconv(.c) c.gpointer {
     var dir_buf: [256]u8 = undefined;
     const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}", .{mount.dir}, 0) catch return null;
     setF2fs(mount.device, "discard_io_aware", "0");
+    reportNvme(mount.device);
     setF2fs(mount.device, "gc_urgent", "0");
     var collecting = false;
     var sleep_ms: u32 = 0;

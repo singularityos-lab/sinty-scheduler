@@ -11,4 +11,6 @@
 #include <gio/gio.h>
 #include <sys/utsname.h>
 #include <sys/ioctl.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <sys/statvfs.h>
