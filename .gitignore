@@ -1,0 +1,9 @@
+zig-out/
+.zig-cache/
+kmod/*.ko
+kmod/*.o
+kmod/*.mod
+kmod/*.mod.c
+kmod/.*
+kmod/Module.symvers
+kmod/modules.order

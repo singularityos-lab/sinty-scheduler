@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=dev.sinty.Scheduler
+Exec=/usr/libexec/sinty-schedd
+User=root
+SystemdService=sinty-schedd.service

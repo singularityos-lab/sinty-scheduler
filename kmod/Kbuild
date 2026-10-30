@@ -1,0 +1,2 @@
+obj-m += sinty_scheduler.o
+ccflags-y += -I$(srctree)/block
