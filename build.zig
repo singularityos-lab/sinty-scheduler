@@ -27,4 +27,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = state_mod })).step);
+    const care_mod = b.createModule(.{
+        .root_source_file = b.path("cmd/sinty-schedd/care.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = care_mod })).step);
 }

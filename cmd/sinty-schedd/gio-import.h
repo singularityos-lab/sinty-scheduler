@@ -10,3 +10,5 @@
 #define G_GNUC_END_IGNORE_DEPRECATIONS
 #include <gio/gio.h>
 #include <sys/utsname.h>
+#include <sys/ioctl.h>
+#include <sys/statvfs.h>

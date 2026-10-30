@@ -4,6 +4,7 @@ const c = @cImport({
     @cInclude("gio-import.h");
 });
 const state = @import("state.zig");
+const care = @import("care.zig");
 
 const NAME = "dev.sinty.Scheduler";
 const PATH = "/dev/sinty/Scheduler";
@@ -15,6 +16,15 @@ const STATE_FILE = "/var/lib/sinty-scheduler/state";
 const SCAN_SECONDS = 2;
 const DSH_DEPTH = 4;
 const REQUEST_KB = "512";
+const CARE_START_SECONDS = 60;
+const CARE_SECONDS = 30;
+const TRIM_FILE = "/var/lib/sinty-scheduler/trim";
+const TRIM_PERIOD_SECONDS = 24 * 3600;
+const TRIM_CHUNK_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+const TRIM_MIN_BYTES: u64 = 64 * 1024;
+const TRIM_PAUSE_SECONDS = 5;
+const FITRIM: c_ulong = 0xC0185879;
+const BUSY_PRESSURE = 30.0;
 
 const XML =
     \\<node>
@@ -427,11 +437,101 @@ fn lost(_: ?*c.GDBusConnection, _: [*c]const u8, data: c.gpointer) callconv(.c) 
     c.g_main_loop_quit(@ptrCast(@alignCast(data)));
 }
 
+const TrimRange = extern struct {
+    start: u64,
+    len: u64,
+    minlen: u64,
+};
+
+fn f2fsAttr(device: []const u8, attr: []const u8, buf: *[256]u8) [:0]const u8 {
+    return std.fmt.bufPrintSentinel(buf, "/sys/fs/f2fs/{s}/{s}", .{ device, attr }, 0) catch unreachable;
+}
+
+fn setF2fs(device: []const u8, attr: []const u8, value: []const u8) void {
+    var buf: [256]u8 = undefined;
+    if (!writeFile(f2fsAttr(device, attr, &buf).ptr, value)) std.log.warn("f2fs {s}: write refused", .{attr});
+}
+
+fn f2fsValue(device: []const u8, attr: []const u8) ?u64 {
+    var path: [256]u8 = undefined;
+    var buf: [32]u8 = undefined;
+    const text = readText(f2fsAttr(device, attr, &path).ptr, &buf) orelse return null;
+    return std.fmt.parseInt(u64, std.mem.trim(u8, text, " \n"), 10) catch null;
+}
+
+fn pressure() f64 {
+    var buf: [256]u8 = undefined;
+    return care.fullPressure(readText("/proc/pressure/io", &buf) orelse return 0);
+}
+
+fn trimDue() bool {
+    var buf: [32]u8 = undefined;
+    const text = readText(TRIM_FILE, &buf) orelse return true;
+    const last = std.fmt.parseInt(i64, std.mem.trim(u8, text, " \n"), 10) catch return true;
+    return @divTrunc(c.g_get_real_time(), 1000000) - last >= TRIM_PERIOD_SECONDS;
+}
+
+fn trim(dir: [*:0]const u8, size: u64) void {
+    const fd = std.c.open(dir, .{ .ACCMODE = .RDONLY });
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+    var start: u64 = 0;
+    while (start < size) : (start += TRIM_CHUNK_BYTES) {
+        var range: TrimRange = .{ .start = start, .len = TRIM_CHUNK_BYTES, .minlen = TRIM_MIN_BYTES };
+        if (c.ioctl(fd, FITRIM, &range) != 0) {
+            std.log.warn("trim stopped at {d}", .{start});
+            return;
+        }
+        c.g_usleep(TRIM_PAUSE_SECONDS * 1000000);
+    }
+    var buf: [32]u8 = undefined;
+    const text = std.fmt.bufPrintSentinel(&buf, "{d}\n", .{@divTrunc(c.g_get_real_time(), 1000000)}, 0) catch unreachable;
+    _ = c.g_mkdir_with_parents("/var/lib/sinty-scheduler", 0o755);
+    _ = c.g_file_set_contents(TRIM_FILE, text.ptr, @intCast(text.len), null);
+}
+
+fn careLoop(_: c.gpointer) callconv(.c) c.gpointer {
+    c.g_usleep(CARE_START_SECONDS * 1000000);
+    var mounts: [16384]u8 = undefined;
+    const mount = care.f2fsMount(readText("/proc/mounts", &mounts) orelse return null) orelse return null;
+    var dir_buf: [256]u8 = undefined;
+    const dir = std.fmt.bufPrintSentinel(&dir_buf, "{s}", .{mount.dir}, 0) catch return null;
+    setF2fs(mount.device, "discard_io_aware", "0");
+    setF2fs(mount.device, "gc_urgent", "0");
+    var collecting = false;
+    var sleep_ms: u32 = 0;
+    while (true) {
+        var fs: c.struct_statvfs = undefined;
+        const free = f2fsValue(mount.device, "free_segments");
+        if (free != null and c.statvfs(dir.ptr, &fs) == 0) {
+            const unit: u64 = fs.f_frsize;
+            const b = care.band(fs.f_blocks * unit / care.SEGMENT_BYTES, fs.f_bavail * unit / care.SEGMENT_BYTES);
+            const next = care.collect(collecting, free.?, b);
+            if (next) {
+                const wanted: u32 = if (free.? >= b.low / 4 and pressure() > BUSY_PRESSURE) 500 else 100;
+                if (wanted != sleep_ms) {
+                    var buf: [16]u8 = undefined;
+                    setF2fs(mount.device, "gc_urgent_sleep_time", std.fmt.bufPrint(&buf, "{d}", .{wanted}) catch unreachable);
+                    sleep_ms = wanted;
+                }
+            }
+            if (next != collecting) {
+                setF2fs(mount.device, "gc_urgent", if (next) "3" else "0");
+                std.log.info("f2fs collection {s}, {d} free segments", .{ if (next) "on" else "off", free.? });
+                collecting = next;
+            }
+            if (trimDue()) trim(dir.ptr, fs.f_blocks * unit);
+        }
+        c.g_usleep(CARE_SECONDS * 1000000);
+    }
+}
+
 pub fn main() void {
     marked = c.g_hash_table_new_full(c.g_str_hash, c.g_str_equal, c.g_free, null);
     request_sizes = c.g_hash_table_new_full(c.g_str_hash, c.g_str_equal, c.g_free, c.g_free);
     load();
     if (current.enabled and !apply()) std.log.warn("sinty-schedd: the kernel module could not be loaded", .{});
+    _ = c.g_thread_new("disk-care", careLoop, null);
     const loop = c.g_main_loop_new(null, 0);
     _ = c.g_bus_own_name(c.G_BUS_TYPE_SYSTEM, NAME, c.G_BUS_NAME_OWNER_FLAGS_NONE, acquired, null, lost, loop, null);
     c.g_main_loop_run(loop);
@@ -439,4 +539,5 @@ pub fn main() void {
 
 test {
     _ = state;
+    _ = care;
 }
