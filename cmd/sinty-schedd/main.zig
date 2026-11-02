@@ -12,6 +12,8 @@ const IFACE = "dev.sinty.Scheduler1";
 const ACTION = "dev.sinty.scheduler.manage";
 const CLASSES = "/sys/kernel/sinty_scheduler/classes";
 const CGROUP = "/sys/fs/cgroup";
+const NATIVE_ENABLE = "/sys/kernel/sinty_scheduler/enable";
+const NATIVE_STATS = "/sys/kernel/sinty_scheduler/stats";
 const STATE_FILE = "/var/lib/sinty-scheduler/state";
 const SCAN_SECONDS = 2;
 const DSH_DEPTH = 4;
@@ -74,7 +76,12 @@ fn loaded() bool {
     return c.g_file_test(CLASSES, c.G_FILE_TEST_EXISTS) != 0;
 }
 
+fn native() bool {
+    return c.g_file_test(NATIVE_ENABLE, c.G_FILE_TEST_EXISTS) != 0;
+}
+
 fn installed() bool {
+    if (native()) return true;
     var u: c.struct_utsname = undefined;
     if (c.uname(&u) != 0) return false;
     var pbuf: [512]u8 = undefined;
@@ -222,8 +229,12 @@ fn scan(_: ?*anyopaque) callconv(.c) c.gboolean {
 
 fn apply() bool {
     if (current.enabled) {
-        if (!loaded() and !modprobe(false)) return false;
-        attach();
+        if (native()) {
+            if (!writeFile(NATIVE_ENABLE, "1")) return false;
+        } else {
+            if (!loaded() and !modprobe(false)) return false;
+            attach();
+        }
         if (scan_source == 0) scan_source = c.g_timeout_add_seconds(SCAN_SECONDS, scan, null);
         return true;
     }
@@ -232,7 +243,10 @@ fn apply() bool {
         scan_source = 0;
     }
     c.g_hash_table_remove_all(marked);
-    if (loaded()) {
+    if (native()) {
+        _ = writeFile(NATIVE_ENABLE, "0");
+        _ = writeFile(CLASSES, "clear");
+    } else if (loaded()) {
         detach();
         _ = writeFile(CLASSES, "clear");
         _ = modprobe(true);
@@ -267,7 +281,10 @@ fn stats(inv: *c.GDBusMethodInvocation) void {
     defer c.g_variant_builder_unref(b);
     const totals = c.g_hash_table_new_full(c.g_str_hash, c.g_str_equal, c.g_free, null);
     defer c.g_hash_table_unref(totals);
-    if (Disks.open()) |disks| {
+    if (native()) {
+        var buf: [2048]u8 = undefined;
+        if (readText(NATIVE_STATS, &buf)) |text| addStats(totals, text);
+    } else if (Disks.open()) |disks| {
         defer disks.close();
         while (disks.next()) |disk| {
             var pbuf: [256]u8 = undefined;
