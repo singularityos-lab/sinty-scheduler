@@ -106,11 +106,19 @@ fn modprobe(remove: bool) bool {
     return c.g_spawn_check_wait_status(status, null) != 0;
 }
 
+fn persist(path: [*:0]const u8, text: [:0]const u8) void {
+    _ = c.g_mkdir_with_parents("/var/lib/sinty-scheduler", 0o755);
+    const flags = c.G_FILE_SET_CONTENTS_CONSISTENT | c.G_FILE_SET_CONTENTS_DURABLE;
+    if (c.g_file_set_contents_full(path, text.ptr, @intCast(text.len), flags, 0o644, null) == 0) return;
+    const dir = std.c.open("/var/lib/sinty-scheduler", .{ .ACCMODE = .RDONLY, .DIRECTORY = true });
+    if (dir < 0) return;
+    _ = std.c.fsync(dir);
+    _ = std.c.close(dir);
+}
+
 fn save() void {
     var buf: [32]u8 = undefined;
-    const text = current.serialize(&buf);
-    _ = c.g_mkdir_with_parents("/var/lib/sinty-scheduler", 0o755);
-    _ = c.g_file_set_contents(STATE_FILE, text.ptr, @intCast(text.len), null);
+    persist(STATE_FILE, current.serialize(&buf));
 }
 
 fn load() void {
@@ -503,8 +511,7 @@ fn trim(dir: [*:0]const u8, size: u64) void {
     }
     var buf: [32]u8 = undefined;
     const text = std.fmt.bufPrintSentinel(&buf, "{d}\n", .{@divTrunc(c.g_get_real_time(), 1000000)}, 0) catch unreachable;
-    _ = c.g_mkdir_with_parents("/var/lib/sinty-scheduler", 0o755);
-    _ = c.g_file_set_contents(TRIM_FILE, text.ptr, @intCast(text.len), null);
+    persist(TRIM_FILE, text);
 }
 
 const NvmeAdminCommand = extern struct {
