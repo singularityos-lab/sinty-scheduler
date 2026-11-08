@@ -38,6 +38,24 @@ pub fn collect(running: bool, free: u64, b: Band) bool {
     return running;
 }
 
+pub fn collectOnBattery(running: bool, free: u64, b: Band) bool {
+    if (free < b.low / 4) return true;
+    if (free >= b.low) return false;
+    return running;
+}
+
+pub fn onMains(supplies: []const []const u8) bool {
+    var battery = false;
+    for (supplies) |entry| {
+        var parts = std.mem.splitScalar(u8, entry, ' ');
+        const kind = parts.next() orelse continue;
+        const online = parts.next() orelse "";
+        if ((std.mem.eql(u8, kind, "Mains") or std.mem.eql(u8, kind, "USB")) and std.mem.eql(u8, online, "1")) return true;
+        if (std.mem.eql(u8, kind, "Battery")) battery = true;
+    }
+    return !battery;
+}
+
 pub fn fullPressure(text: []const u8) f64 {
     const line = std.mem.indexOf(u8, text, "full avg10=") orelse return 0;
     const start = line + "full avg10=".len;
@@ -153,4 +171,20 @@ test "reads full pressure" {
     const psi = "some avg10=47.59 avg60=62.49 avg300=34.00 total=1\nfull avg10=37.56 avg60=51.31 avg300=27.90 total=1\n";
     try std.testing.expectEqual(@as(f64, 37.56), fullPressure(psi));
     try std.testing.expectEqual(@as(f64, 0), fullPressure("garbage"));
+}
+
+test "on battery collects only when space runs out" {
+    const b = Band{ .low = 400, .high = 600 };
+    try std.testing.expect(!collectOnBattery(false, 300, b));
+    try std.testing.expect(collectOnBattery(false, 90, b));
+    try std.testing.expect(collectOnBattery(true, 300, b));
+    try std.testing.expect(!collectOnBattery(true, 400, b));
+}
+
+test "tells mains from battery" {
+    try std.testing.expect(onMains(&.{}));
+    try std.testing.expect(onMains(&.{ "Mains 1", "Battery 1" }));
+    try std.testing.expect(!onMains(&.{ "Mains 0", "Battery 1" }));
+    try std.testing.expect(!onMains(&.{"Battery 1"}));
+    try std.testing.expect(onMains(&.{"Mains 0"}));
 }

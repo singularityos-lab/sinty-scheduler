@@ -25,6 +25,10 @@ Turning it off restores the previous scheduler.
   is pending, for at most 500 ms.
 - Background keeps at least 10% of the dispatches.
 - Requests are limited to 512 KB while the scheduler is on.
+- `sinty-schedd` also looks after the f2fs root: it trims free space once in a while
+  and collects segments in the background when free space runs low. On battery it
+  trims nothing, collects only when free space is almost gone and checks every two
+  minutes instead of every thirty seconds.
 
 ## Components
 

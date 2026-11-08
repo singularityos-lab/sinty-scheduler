@@ -20,6 +20,7 @@ const DSH_DEPTH = 4;
 const REQUEST_KB = "512";
 const CARE_START_SECONDS = 60;
 const CARE_SECONDS = 30;
+const CARE_BATTERY_SECONDS = 120;
 const TRIM_FILE = "/var/lib/sinty-scheduler/trim";
 const TRIM_PERIOD_SECONDS = 24 * 3600;
 const TRIM_CHUNK_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -489,6 +490,28 @@ fn pressure() f64 {
     return care.fullPressure(readText("/proc/pressure/io", &buf) orelse return 0);
 }
 
+fn onMains() bool {
+    const dir = c.g_dir_open("/sys/class/power_supply", 0, null) orelse return true;
+    defer c.g_dir_close(dir);
+    var entries: [16][32]u8 = undefined;
+    var list: [16][]const u8 = undefined;
+    var n: usize = 0;
+    while (c.g_dir_read_name(dir)) |name| {
+        if (n == list.len) break;
+        var path_buf: [128]u8 = undefined;
+        var type_buf: [16]u8 = undefined;
+        var online_buf: [8]u8 = undefined;
+        const base = std.mem.span(name);
+        const type_path = std.fmt.bufPrintSentinel(&path_buf, "/sys/class/power_supply/{s}/type", .{base}, 0) catch continue;
+        const kind = std.mem.trim(u8, readText(type_path, &type_buf) orelse continue, " \n");
+        const online_path = std.fmt.bufPrintSentinel(&path_buf, "/sys/class/power_supply/{s}/online", .{base}, 0) catch continue;
+        const online = std.mem.trim(u8, readText(online_path, &online_buf) orelse "", " \n");
+        list[n] = std.fmt.bufPrint(&entries[n], "{s} {s}", .{ kind, online }) catch continue;
+        n += 1;
+    }
+    return care.onMains(list[0..n]);
+}
+
 fn trimDue() bool {
     var buf: [32]u8 = undefined;
     const text = readText(TRIM_FILE, &buf) orelse return true;
@@ -575,7 +598,8 @@ fn careLoop(_: c.gpointer) callconv(.c) c.gpointer {
         if (free != null and c.statvfs(dir.ptr, &fs) == 0) {
             const unit: u64 = fs.f_frsize;
             const b = care.band(fs.f_blocks * unit / care.SEGMENT_BYTES, fs.f_bavail * unit / care.SEGMENT_BYTES);
-            const next = care.collect(collecting, free.?, b);
+            const mains = onMains();
+            const next = if (mains) care.collect(collecting, free.?, b) else care.collectOnBattery(collecting, free.?, b);
             if (next) {
                 const wanted: u32 = if (free.? >= b.low / 4 and pressure() > BUSY_PRESSURE) 500 else 100;
                 if (wanted != sleep_ms) {
@@ -589,7 +613,10 @@ fn careLoop(_: c.gpointer) callconv(.c) c.gpointer {
                 std.log.info("f2fs collection {s}, {d} free segments", .{ if (next) "on" else "off", free.? });
                 collecting = next;
             }
-            if (trimDue()) trim(dir.ptr, fs.f_blocks * unit);
+            if (mains and trimDue()) trim(dir.ptr, fs.f_blocks * unit);
+            const wait: c.gulong = if (mains or collecting) CARE_SECONDS else CARE_BATTERY_SECONDS;
+            c.g_usleep(wait * 1000000);
+            continue;
         }
         c.g_usleep(CARE_SECONDS * 1000000);
     }
