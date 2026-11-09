@@ -37,6 +37,8 @@ const XML =
     \\    <method name="SetEnabled"><arg name="enabled" type="b" direction="in"/></method>
     \\    <method name="SetClasses"><arg name="classes" type="a{ss}" direction="in"/></method>
     \\    <method name="GetStats"><arg name="stats" type="a{sx}" direction="out"/></method>
+    \\    <method name="Announce"><arg name="threads" type="au" direction="in"/></method>
+    \\    <method name="GetBackground"><arg name="processes" type="a{uau}" direction="out"/></method>
     \\  </interface>
     \\</node>
 ;
@@ -46,6 +48,14 @@ var current: state.State = .{};
 var scan_source: c.guint = 0;
 var marked: ?*c.GHashTable = null;
 var request_sizes: ?*c.GHashTable = null;
+var announced: ?*c.GHashTable = null;
+
+const Announced = struct {
+    pid: u32,
+    threads: *c.GArray,
+};
+
+const IOPRIO_IDLE: c_long = 3 << 13;
 
 fn vt(s: [*:0]const u8) *const c.GVariantType {
     return @ptrCast(s);
@@ -301,6 +311,7 @@ fn stats(inv: *c.GDBusMethodInvocation) void {
             addStats(totals, readText(queueFile(disk, "iosched/stats", &pbuf), &buf) orelse continue);
         }
     }
+    addAnnounced(totals);
     var iter: c.GHashTableIter = undefined;
     c.g_hash_table_iter_init(&iter, totals);
     var key: c.gpointer = null;
@@ -309,6 +320,111 @@ fn stats(inv: *c.GDBusMethodInvocation) void {
         c.g_variant_builder_add(b, "{sx}", @as([*c]const u8, @ptrCast(key)), @as(i64, @intCast(@intFromPtr(value))));
     }
     c.g_dbus_method_invocation_return_value(inv, c.g_variant_new("(a{sx})", b));
+}
+
+fn freeAnnounced(data: c.gpointer) callconv(.c) void {
+    const entry: *Announced = @ptrCast(@alignCast(data));
+    _ = c.g_array_free(entry.threads, 1);
+    c.g_free(entry);
+}
+
+fn ownThread(pid: u32, tid: u32) bool {
+    var buf: [64]u8 = undefined;
+    const path = std.fmt.bufPrintSentinel(&buf, "/proc/{d}/task/{d}", .{ pid, tid }, 0) catch return false;
+    return c.g_file_test(path.ptr, c.G_FILE_TEST_IS_DIR) != 0;
+}
+
+fn lowerThread(tid: u32) void {
+    _ = std.os.linux.syscall3(.ioprio_set, 1, tid, @bitCast(IOPRIO_IDLE));
+}
+
+const Announce = struct {
+    invocation: *c.GDBusMethodInvocation,
+    threads: *c.GVariant,
+};
+
+fn announcedBy(src: [*c]c.GObject, res: ?*c.GAsyncResult, data: c.gpointer) callconv(.c) void {
+    const call: *Announce = @ptrCast(@alignCast(data));
+    defer {
+        c.g_object_unref(call.invocation);
+        c.g_variant_unref(call.threads);
+        c.g_free(call);
+    }
+    var err: [*c]c.GError = null;
+    const reply = c.g_dbus_connection_call_finish(@ptrCast(src), res, &err) orelse {
+        c.g_dbus_method_invocation_take_error(call.invocation, err);
+        return;
+    };
+    defer c.g_variant_unref(reply);
+    var pid: c.guint32 = 0;
+    c.g_variant_get(reply, "(u)", &pid);
+    const sender = c.g_dbus_method_invocation_get_sender(call.invocation);
+    const threads = c.g_array_new(0, 0, @sizeOf(u32));
+    var iter: c.GVariantIter = undefined;
+    _ = c.g_variant_iter_init(&iter, call.threads);
+    var tid: c.guint32 = 0;
+    while (c.g_variant_iter_next(&iter, "u", &tid) != 0) {
+        if (!ownThread(pid, tid)) continue;
+        if (current.enabled) lowerThread(tid);
+        _ = c.g_array_append_vals(threads, &tid, 1);
+    }
+    if (threads.*.len == 0) {
+        _ = c.g_array_free(threads, 1);
+        _ = c.g_hash_table_remove(announced, sender);
+    } else {
+        const entry: *Announced = @ptrCast(@alignCast(c.g_malloc0(@sizeOf(Announced))));
+        entry.* = .{ .pid = pid, .threads = threads };
+        _ = c.g_hash_table_insert(announced, c.g_strdup(sender), entry);
+    }
+    c.g_dbus_method_invocation_return_value(call.invocation, null);
+}
+
+fn announce(inv: *c.GDBusMethodInvocation, params: ?*c.GVariant) void {
+    const call: *Announce = @ptrCast(@alignCast(c.g_malloc0(@sizeOf(Announce))));
+    call.* = .{
+        .invocation = @ptrCast(@alignCast(c.g_object_ref(inv))),
+        .threads = c.g_variant_get_child_value(params, 0).?,
+    };
+    const sender = c.g_dbus_method_invocation_get_sender(inv);
+    c.g_dbus_connection_call(connection, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "GetConnectionUnixProcessID", c.g_variant_new("(s)", sender), vt("(u)"), c.G_DBUS_CALL_FLAGS_NONE, -1, null, announcedBy, call);
+}
+
+fn background(inv: *c.GDBusMethodInvocation) void {
+    const b = c.g_variant_builder_new(vt("a{uau}"));
+    defer c.g_variant_builder_unref(b);
+    var iter: c.GHashTableIter = undefined;
+    c.g_hash_table_iter_init(&iter, announced);
+    var value: c.gpointer = null;
+    while (c.g_hash_table_iter_next(&iter, null, &value) != 0) {
+        const entry: *Announced = @ptrCast(@alignCast(value));
+        const tids = c.g_variant_builder_new(vt("au"));
+        defer c.g_variant_builder_unref(tids);
+        const items: [*]u32 = @ptrCast(@alignCast(entry.threads.*.data));
+        for (items[0..entry.threads.*.len]) |tid| c.g_variant_builder_add(tids, "u", tid);
+        c.g_variant_builder_add(b, "{uau}", entry.pid, tids);
+    }
+    c.g_dbus_method_invocation_return_value(inv, c.g_variant_new("(a{uau})", b));
+}
+
+fn addAnnounced(totals: ?*c.GHashTable) void {
+    var threads: usize = 0;
+    var iter: c.GHashTableIter = undefined;
+    c.g_hash_table_iter_init(&iter, announced);
+    var value: c.gpointer = null;
+    while (c.g_hash_table_iter_next(&iter, null, &value) != 0) {
+        const entry: *Announced = @ptrCast(@alignCast(value));
+        threads += entry.threads.*.len;
+    }
+    _ = c.g_hash_table_insert(totals, c.g_strdup("announced_processes"), @ptrFromInt(c.g_hash_table_size(announced)));
+    _ = c.g_hash_table_insert(totals, c.g_strdup("announced_threads"), @ptrFromInt(threads));
+}
+
+fn ownerChanged(_: ?*c.GDBusConnection, _: [*c]const u8, _: [*c]const u8, _: [*c]const u8, _: [*c]const u8, params: ?*c.GVariant, _: c.gpointer) callconv(.c) void {
+    var name: [*c]const u8 = null;
+    var old: [*c]const u8 = null;
+    var new: [*c]const u8 = null;
+    c.g_variant_get(params, "(&s&s&s)", &name, &old, &new);
+    if (new[0] == 0) _ = c.g_hash_table_remove(announced, name);
 }
 
 const Call = struct {
@@ -436,6 +552,8 @@ fn methodCall(_: ?*c.GDBusConnection, _: [*c]const u8, _: [*c]const u8, _: [*c]c
     const i = inv orelse return;
     const m = std.mem.span(method);
     if (std.mem.eql(u8, m, "GetStats")) return stats(i);
+    if (std.mem.eql(u8, m, "Announce")) return announce(i, params);
+    if (std.mem.eql(u8, m, "GetBackground")) return background(i);
     if (std.mem.eql(u8, m, "SetClasses")) return askUser(newCall(i, params), classesByUser);
     authorize(i, params);
 }
@@ -457,6 +575,7 @@ fn acquired(conn: ?*c.GDBusConnection, _: [*c]const u8, _: c.gpointer) callconv(
     var err: [*c]c.GError = null;
     const info = c.g_dbus_node_info_new_for_xml(XML, &err) orelse fatal("{s}", .{err.*.message});
     if (c.g_dbus_connection_register_object(conn, PATH, info.*.interfaces[0], &vtable, null, null, &err) == 0) fatal("{s}", .{err.*.message});
+    _ = c.g_dbus_connection_signal_subscribe(conn, "org.freedesktop.DBus", "org.freedesktop.DBus", "NameOwnerChanged", "/org/freedesktop/DBus", null, c.G_DBUS_SIGNAL_FLAGS_NONE, ownerChanged, null, null);
 }
 
 fn lost(_: ?*c.GDBusConnection, _: [*c]const u8, data: c.gpointer) callconv(.c) void {
@@ -625,6 +744,7 @@ fn careLoop(_: c.gpointer) callconv(.c) c.gpointer {
 pub fn main() void {
     marked = c.g_hash_table_new_full(c.g_str_hash, c.g_str_equal, c.g_free, null);
     request_sizes = c.g_hash_table_new_full(c.g_str_hash, c.g_str_equal, c.g_free, c.g_free);
+    announced = c.g_hash_table_new_full(c.g_str_hash, c.g_str_equal, c.g_free, freeAnnounced);
     load();
     if (current.enabled and !apply()) std.log.warn("sinty-schedd: the kernel module could not be loaded", .{});
     _ = c.g_thread_new("disk-care", careLoop, null);
