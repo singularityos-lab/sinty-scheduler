@@ -15,7 +15,14 @@ Turning it off restores the previous scheduler.
   as interactive, so background work cannot hold it back.
 - `normal`: the other open apps, and delayed writes of the app in focus.
 - `background`: dsh, VMs and builds running there, hidden apps when Lighter Background
-  Apps is on, delayed writes of normal apps, discards, and anything at idle I/O priority.
+  Apps is on, delayed writes of normal apps, synchronous writes and flushes of apps not
+  in focus, discards, and anything at idle I/O priority.
+
+Apps known to flush far more often than they need to are listed in
+`/usr/share/sinty-scheduler/fsync-heavy.conf`, one desktop id per line, and
+`/etc/sinty-scheduler/fsync-heavy.conf` adds local ones. Their synchronous writes go
+to `background` even while they are in focus. In the cgroup table such an entry reads
+`interactive,fsync /user.slice/.../app-firefox.scope`.
 
 ## Rules
 
@@ -28,7 +35,8 @@ Turning it off restores the previous scheduler.
 - `sinty-schedd` also looks after the f2fs root: it trims free space once in a while
   and collects segments in the background when free space runs low. On battery it
   trims nothing, collects only when free space is almost gone and checks every two
-  minutes instead of every thirty seconds.
+  minutes instead of every thirty seconds. On mains it also tidies up while free space
+  is under 30%.
 
 ## Components
 
@@ -39,7 +47,8 @@ Turning it off restores the previous scheduler.
   requires the `dev.sinty.scheduler.manage` polkit action. Local users may set classes
   only on cgroups in their own slice.
 - `tests/`: the release check, a VM that writes 5 GB while a probe measures fsync and
-  reads with and without the scheduler.
+  reads with and without the scheduler. With `GATE_ARGS=GATE_CLASSES=1` it instead
+  checks which class the flushes of focused, unfocused and fsync-heavy cgroups land in.
 
 ## Build
 

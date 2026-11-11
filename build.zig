@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
     b.installFile("data/dev.sinty.Scheduler.conf", "share/dbus-1/system.d/dev.sinty.Scheduler.conf");
     b.installFile("data/dev.sinty.Scheduler.service", "share/dbus-1/system-services/dev.sinty.Scheduler.service");
     b.installFile("data/dev.sinty.scheduler.policy", "share/polkit-1/actions/dev.sinty.scheduler.policy");
+    b.installFile("data/fsync-heavy.conf", "share/sinty-scheduler/fsync-heavy.conf");
     b.installFile("data/sinty-schedd.service", "lib/systemd/system/sinty-schedd.service");
 
     const test_step = b.step("test", "run tests");

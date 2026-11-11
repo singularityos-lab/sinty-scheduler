@@ -38,6 +38,15 @@ pub fn collect(running: bool, free: u64, b: Band) bool {
     return running;
 }
 
+pub const TIDY_PERCENT: u64 = 30;
+
+pub fn tidy(running: bool, free: u64, available: u64, total: u64) bool {
+    if (total == 0 or available * 100 >= total * TIDY_PERCENT) return false;
+    if (free * 100 < available * 80) return true;
+    if (free * 100 >= available * 90) return false;
+    return running;
+}
+
 pub fn collectOnBattery(running: bool, free: u64, b: Band) bool {
     if (free < b.low / 4) return true;
     if (free >= b.low) return false;
@@ -171,6 +180,15 @@ test "reads full pressure" {
     const psi = "some avg10=47.59 avg60=62.49 avg300=34.00 total=1\nfull avg10=37.56 avg60=51.31 avg300=27.90 total=1\n";
     try std.testing.expectEqual(@as(f64, 37.56), fullPressure(psi));
     try std.testing.expectEqual(@as(f64, 0), fullPressure("garbage"));
+}
+
+test "on mains tidies a disk under 30 percent free" {
+    try std.testing.expect(!tidy(false, 100, 400, 1000));
+    try std.testing.expect(tidy(false, 200, 290, 1000));
+    try std.testing.expect(tidy(true, 250, 290, 1000));
+    try std.testing.expect(!tidy(false, 250, 290, 1000));
+    try std.testing.expect(!tidy(true, 262, 290, 1000));
+    try std.testing.expect(!tidy(true, 10, 0, 0));
 }
 
 test "on battery collects only when space runs out" {

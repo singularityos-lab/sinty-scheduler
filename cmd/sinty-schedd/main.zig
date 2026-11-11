@@ -14,6 +14,7 @@ const CLASSES = "/sys/kernel/sinty_scheduler/classes";
 const CGROUP = "/sys/fs/cgroup";
 const NATIVE_ENABLE = "/sys/kernel/sinty_scheduler/enable";
 const NATIVE_STATS = "/sys/kernel/sinty_scheduler/stats";
+const FSYNC_LISTS = [_][*:0]const u8{ "/usr/share/sinty-scheduler/fsync-heavy.conf", "/etc/sinty-scheduler/fsync-heavy.conf" };
 const STATE_FILE = "/var/lib/sinty-scheduler/state";
 const SCAN_SECONDS = 2;
 const DSH_DEPTH = 4;
@@ -141,6 +142,16 @@ fn setClass(class: []const u8, path: []const u8) bool {
     var buf: [1024]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "{s} {s}", .{ class, path }) catch return false;
     return writeFile(CLASSES, line);
+}
+
+fn fsyncHeavy(path: []const u8) bool {
+    var buf: [16384]u8 = undefined;
+    for (FSYNC_LISTS) |list| {
+        if (readText(list, &buf)) |text| {
+            if (state.fsyncHeavy(text, path)) return true;
+        }
+    }
+    return false;
 }
 
 const Disks = struct {
@@ -476,7 +487,10 @@ fn runClasses(call: *Call, uid: u32) void {
         const k = std.mem.span(class);
         if (!state.pathAllowed(uid, p) or !state.validClass(k))
             return c.g_dbus_method_invocation_return_dbus_error(inv, "dev.sinty.Scheduler1.Error.NotAuthorized", "Not your session.");
-        _ = setClass(k, p);
+        var flagged: [32]u8 = undefined;
+        var kind: []const u8 = k;
+        if (fsyncHeavy(p)) kind = std.fmt.bufPrint(&flagged, "{s},fsync", .{k}) catch k;
+        _ = setClass(kind, p);
     }
     c.g_dbus_method_invocation_return_value(inv, null);
 }
@@ -718,9 +732,12 @@ fn careLoop(_: c.gpointer) callconv(.c) c.gpointer {
             const unit: u64 = fs.f_frsize;
             const b = care.band(fs.f_blocks * unit / care.SEGMENT_BYTES, fs.f_bavail * unit / care.SEGMENT_BYTES);
             const mains = onMains();
-            const next = if (mains) care.collect(collecting, free.?, b) else care.collectOnBattery(collecting, free.?, b);
+            const total = fs.f_blocks * unit / care.SEGMENT_BYTES;
+            const available = fs.f_bavail * unit / care.SEGMENT_BYTES;
+            const urgent = if (mains) care.collect(collecting, free.?, b) else care.collectOnBattery(collecting, free.?, b);
+            const next = urgent or (mains and care.tidy(collecting, free.?, available, total));
             if (next) {
-                const wanted: u32 = if (free.? >= b.low / 4 and pressure() > BUSY_PRESSURE) 500 else 100;
+                const wanted: u32 = if (!urgent or free.? >= b.low / 4 and pressure() > BUSY_PRESSURE) 500 else 100;
                 if (wanted != sleep_ms) {
                     var buf: [16]u8 = undefined;
                     setF2fs(mount.device, "gc_urgent_sleep_time", std.fmt.bufPrint(&buf, "{d}", .{wanted}) catch unreachable);

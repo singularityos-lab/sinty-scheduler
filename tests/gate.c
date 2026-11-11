@@ -225,6 +225,83 @@ static void scenario(const char *name, const char *scheduler, const char *dirty_
 		die("umount");
 }
 
+static long long stat_value(const char *key)
+{
+	char buf[4096], *at;
+	int fd = open("/sys/block/vda/queue/iosched/stats", O_RDONLY);
+	ssize_t got;
+	size_t len = strlen(key);
+
+	if (fd < 0)
+		die("stats");
+	got = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (got <= 0)
+		die("stats");
+	buf[got] = '\0';
+	for (at = buf; (at = strstr(at, key)); at += len) {
+		if ((at == buf || at[-1] == '\n') && at[len] == ' ')
+			return atoll(at + len + 1);
+	}
+	return -1;
+}
+
+static long long synced_by(const char *group, const char *file)
+{
+	static char page[4096];
+	long long before = stat_value("background_ios");
+	int status, fd, i;
+	pid_t pid = fork();
+
+	if (pid == 0) {
+		char path[64];
+
+		snprintf(path, sizeof(path), "/sys/fs/cgroup/%s/cgroup.procs", group);
+		put(path, "%d", getpid());
+		fd = open(file, O_RDWR | O_CREAT, 0644);
+		if (fd < 0)
+			die(file);
+		for (i = 0; i < 64; i++) {
+			memset(page, i, sizeof(page));
+			if (pwrite(fd, page, sizeof(page), (off_t)i * 1048576) != sizeof(page) || fsync(fd))
+				die("fsync");
+		}
+		close(fd);
+		_exit(0);
+	}
+	waitpid(pid, &status, 0);
+	return stat_value("background_ios") - before;
+}
+
+static void classes(void)
+{
+	char *mkfs[] = { "/mkfs.f2fs", "-f", "-q", "/dev/vda", NULL };
+	long long fg, nf, hv;
+	int fd;
+
+	run(mkfs);
+	if (mount("/dev/vda", "/mnt", "f2fs", 0, NULL))
+		die("mount");
+	mkdir("/sys/fs/cgroup/nf", 0755);
+	mkdir("/sys/fs/cgroup/hv", 0755);
+	put("/sys/block/vda/queue/scheduler", "sinty");
+	put("/sys/kernel/sinty_scheduler/classes", "interactive /fg");
+	put("/sys/kernel/sinty_scheduler/classes", "normal /nf");
+	put("/sys/kernel/sinty_scheduler/classes", "interactive,fsync /hv");
+	fd = open("/sys/kernel/sinty_scheduler/classes", O_WRONLY);
+	printf("GATE_CLASS bogus_flag_refused=%d\n", fd >= 0 && write(fd, "normal,bogus /nf", 16) < 0);
+	close(fd);
+	sync();
+	fg = synced_by("fg", "/mnt/fg");
+	nf = synced_by("nf", "/mnt/nf");
+	hv = synced_by("hv", "/mnt/hv");
+	printf("GATE_CLASS focused=%lld unfocused=%lld fsync_heavy=%lld\n", fg, nf, hv);
+	printf("GATE_CLASS verdict=%s\n", fg < 16 && nf >= 64 && hv >= 64 ? "pass" : "fail");
+	put("/sys/kernel/sinty_scheduler/classes", "clear");
+	put("/sys/block/vda/queue/scheduler", "none");
+	umount("/mnt");
+}
+
 int main(void)
 {
 	int fd;
@@ -242,6 +319,14 @@ int main(void)
 	mkdir("/sys/fs/cgroup/fg", 0755);
 	mkdir("/sys/fs/cgroup/bg", 0755);
 	put("/sys/fs/cgroup/fg/cgroup.procs", "%d", getpid());
+	if (getenv("GATE_CLASSES")) {
+		classes();
+		printf("GATE_DONE\n");
+		fflush(stdout);
+		sync();
+		reboot(RB_POWER_OFF);
+		return 0;
+	}
 	if (!getenv("GATE_ONLY")) {
 		scenario("before", "none", NULL, NULL);
 		scenario("writeback", "none", "268435456", "67108864");

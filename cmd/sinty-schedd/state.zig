@@ -62,6 +62,36 @@ pub fn validClass(name: []const u8) bool {
     return std.mem.eql(u8, name, "interactive") or std.mem.eql(u8, name, "normal") or std.mem.eql(u8, name, "background");
 }
 
+fn scopeChar(ch: u8) u8 {
+    return switch (ch) {
+        'a'...'z', 'A'...'Z', '0'...'9', '.', '-', '_' => ch,
+        else => '_',
+    };
+}
+
+fn sameApp(entry: []const u8, id: []const u8) bool {
+    const app = if (std.mem.endsWith(u8, entry, ".desktop")) entry[0 .. entry.len - 8] else entry;
+    if (app.len != id.len) return false;
+    for (app, id) |a, b| {
+        if (scopeChar(a) != b) return false;
+    }
+    return true;
+}
+
+pub fn fsyncHeavy(list: []const u8, path: []const u8) bool {
+    const leaf = path[(std.mem.lastIndexOfScalar(u8, path, '/') orelse return false) + 1 ..];
+    if (!std.mem.startsWith(u8, leaf, "app-") or !std.mem.endsWith(u8, leaf, ".scope")) return false;
+    const id = leaf[4 .. leaf.len - 6];
+    if (id.len == 0) return false;
+    var lines = std.mem.tokenizeScalar(u8, list, '\n');
+    while (lines.next()) |line| {
+        const entry = std.mem.trim(u8, line, " \t\r");
+        if (entry.len == 0 or entry[0] == '#') continue;
+        if (sameApp(entry, id)) return true;
+    }
+    return false;
+}
+
 test "state survives a round trip" {
     var buf: [32]u8 = undefined;
     try std.testing.expect(State.parse((State{ .enabled = true }).serialize(&buf)).enabled);
@@ -94,4 +124,15 @@ test "a user can only classify cgroups of their own slice" {
     try std.testing.expect(!pathAllowed(1001, "/user.slice/user-1001.slice/../../system.slice"));
     try std.testing.expect(!pathAllowed(1001, "/user.slice/user-1001.slice/a b"));
     try std.testing.expect(!pathAllowed(1001, "/system.slice/x"));
+}
+
+test "listed apps are flagged as fsync heavy" {
+    const list = "# browsers\nfirefox\n  org.chromium.Chromium.desktop \ncom discord\n";
+    try std.testing.expect(fsyncHeavy(list, "/user.slice/user-1001.slice/app-firefox.scope"));
+    try std.testing.expect(fsyncHeavy(list, "/user.slice/user-1001.slice/app-org.chromium.Chromium.scope"));
+    try std.testing.expect(fsyncHeavy(list, "/user.slice/user-1001.slice/app-com_discord.scope"));
+    try std.testing.expect(!fsyncHeavy(list, "/user.slice/user-1001.slice/app-firefox-esr.scope"));
+    try std.testing.expect(!fsyncHeavy(list, "/user.slice/user-1001.slice/firefox.scope"));
+    try std.testing.expect(!fsyncHeavy(list, "/user.slice/user-1001.slice/app-.scope"));
+    try std.testing.expect(!fsyncHeavy("#firefox\n", "/user.slice/user-1001.slice/app-firefox.scope"));
 }

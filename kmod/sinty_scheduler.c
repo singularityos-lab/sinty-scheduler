@@ -34,6 +34,9 @@ enum {
 #define SINTY_MIN_NORMAL 8
 #define SINTY_BUCKETS 24
 #define SINTY_FLUSH_HOLD_NS (500 * NSEC_PER_MSEC)
+#define SINTY_CLASS_MASK 0x0f
+#define SINTY_FSYNC_HEAVY 0x10
+#define SINTY_UNLISTED -1
 
 static const char *const sinty_class_names[SINTY_CLASSES] = {
 	"interactive", "normal", "background",
@@ -93,7 +96,7 @@ static int sinty_table_class(struct cgroup *cgroup, int fallback)
 static int sinty_classify(blk_opf_t opf, struct cgroup_subsys_state *css, u16 prio)
 {
 	int ioclass = IOPRIO_PRIO_CLASS(prio);
-	int class;
+	int class, raw;
 
 	if (opf & (REQ_META | REQ_PRIO | REQ_SWAP))
 		return SINTY_INTERACTIVE;
@@ -103,14 +106,21 @@ static int sinty_classify(blk_opf_t opf, struct cgroup_subsys_state *css, u16 pr
 		return SINTY_BACKGROUND;
 	if (ioclass == IOPRIO_CLASS_RT)
 		return SINTY_INTERACTIVE;
-	class = SINTY_NORMAL;
+	raw = SINTY_UNLISTED;
 	if (css) {
 		rcu_read_lock();
-		class = sinty_table_class(css->cgroup, SINTY_NORMAL);
+		raw = sinty_table_class(css->cgroup, SINTY_UNLISTED);
 		rcu_read_unlock();
 	}
+	if (raw == SINTY_UNLISTED)
+		class = SINTY_NORMAL;
+	else
+		class = raw & SINTY_CLASS_MASK;
 	if (op_is_write(opf) && !op_is_sync(opf))
 		return min(class + 1, SINTY_BACKGROUND);
+	if (op_is_write(opf) && raw != SINTY_UNLISTED &&
+	    (class == SINTY_NORMAL || (raw & SINTY_FSYNC_HEAVY)))
+		return SINTY_BACKGROUND;
 	return class;
 }
 
@@ -267,7 +277,7 @@ static void sinty_limit_depth(blk_opf_t opf, struct blk_mq_alloc_data *data)
 	int class;
 
 	rcu_read_lock();
-	class = sinty_table_class(task_css(current, io_cgrp_id)->cgroup, SINTY_NORMAL);
+	class = sinty_table_class(task_css(current, io_cgrp_id)->cgroup, SINTY_NORMAL) & SINTY_CLASS_MASK;
 	rcu_read_unlock();
 	if (class == SINTY_BACKGROUND)
 		data->shallow_depth = max(1U, q->nr_requests / 4);
@@ -558,7 +568,7 @@ static ssize_t classes_show(struct kobject *kobj, struct kobj_attribute *attr, c
 static ssize_t classes_store(struct kobject *kobj, struct kobj_attribute *attr,
 			     const char *buf, size_t count)
 {
-	char *copy, *line, *path;
+	char *copy, *line, *path, *flags;
 	int class, ret;
 
 	copy = kstrndup(buf, count, GFP_KERNEL);
@@ -578,11 +588,21 @@ static ssize_t classes_store(struct kobject *kobj, struct kobj_attribute *attr,
 		goto out;
 	}
 	*path++ = '\0';
+	flags = strchr(line, ',');
+	if (flags) {
+		*flags++ = '\0';
+		if (strcmp(flags, "fsync")) {
+			ret = -EINVAL;
+			goto out;
+		}
+	}
 	class = match_string(sinty_class_names, SINTY_CLASSES, line);
 	if (class < 0) {
 		ret = -EINVAL;
 		goto out;
 	}
+	if (flags)
+		class |= SINTY_FSYNC_HEAVY;
 	ret = sinty_table_set(path, class);
 	if (!ret)
 		ret = count;
